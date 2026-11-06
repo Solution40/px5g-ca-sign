@@ -110,6 +110,35 @@ qemu-user; the aarch64 build also on the real router).
 (The official 25.12 aarch64 package is 16.3 KB; the difference to the 13.7 KB here comes from build
 flags. The increase, about 12–14 KB, is what the change adds.)
 
+## Try it on your own router (OpenWrt SDK)
+
+Help with real MIPS and ARM routers is welcome. With the SDK for your target (25.12 or snapshot):
+
+```sh
+cd openwrt-sdk-*
+./scripts/feeds update base && ./scripts/feeds install px5g-mbedtls
+cp /path/to/px5g-ca-sign/px5g-mbedtls.c feeds/base/package/utils/px5g-mbedtls/
+make defconfig && make package/px5g-mbedtls/compile V=s
+find bin -name 'px5g-mbedtls*'
+```
+
+Install the package on the router (`apk add --allow-untrusted /tmp/px5g-mbedtls-*.apk` on 25.12,
+`opkg install` on 24.10), then:
+
+```sh
+cd /tmp
+px5g ca -newkey ec -days 30 -subj /CN=Test-CA -keyout t-ca.key -out t-ca.crt
+px5g sign -CA t-ca.crt -CAkey t-ca.key -newkey ec -days 30 -subj /CN=test.lan \
+    -addext subjectAltName=DNS:test.lan -keyout t.key -out t.crt
+px5g sign -CA t-ca.crt -CAkey t-ca.key -newkey ec -days 30 -subj /CN=test-client \
+    -addext extendedKeyUsage=clientAuth -keyout c.key -out c.crt
+```
+
+Copy `t-ca.crt`, `t.crt` and `c.crt` to a PC and check them with
+`openssl verify -x509_strict -purpose sslserver -CAfile t-ca.crt t.crt` and `-purpose sslclient … c.crt`.
+`selfsigned` (used by uhttpd) is unchanged, so keeping the package installed is harmless; reinstall
+px5g-mbedtls from the feed to go back. Please report the target, the result and `ls -l /usr/sbin/px5g`.
+
 ## For the maintainer
 
 `patches/` holds the change as a series for OpenWrt master (applies with `git am`):
