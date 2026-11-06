@@ -1,0 +1,571 @@
+From fdd53a824cba3bd177b6b474cfd557d2bbdd82da Mon Sep 17 00:00:00 2001
+From: Solution40 <72304265+Solution40@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 16:00:00 +0100
+Subject: [PATCH 1/2] px5g-mbedtls: add ca and sign commands
+
+Let a router run its own small certificate authority with mbedtls only,
+for routers where OpenSSL does not fit:
+
+  px5g ca    a CA certificate: CA:TRUE (critical), keyCertSign and
+             cRLSign, optional -pathlen
+  px5g sign  a certificate signed by -CA/-CAkey: a server certificate
+             (default: serverAuth, needs at least one subjectAltName)
+             or a client certificate (-addext extendedKeyUsage=clientAuth,
+             e.g. for OpenVPN; no subjectAltName needed)
+
+Options follow selfsigned (-newkey, -key, -days, -subj, -keyout, -out,
+-der, -addext subjectAltName=/extendedKeyUsage=). selfsigned, eckey and
+rsakey behave as before.
+
+The CA key has to match the CA certificate, the CA has to be a CA that
+may sign and be valid now; the validity is capped at the CA's end, the
+new certificate is verified against the CA before anything is written.
+New keys and certificates go to temporary files that are renamed into
+place only when everything worked (keys 0600, certificates 0644).
+
+Size: about +12 KB (aarch64 13.7 -> 25.9 KB, mipsel 12.0 -> 25.6 KB,
+arm_cortex-a7 11.3 -> 23.4 KB, dynamically linked to libmbedtls 3.6).
+---
+ package/utils/px5g-mbedtls/Makefile       |   2 +-
+ package/utils/px5g-mbedtls/px5g-mbedtls.c | 369 ++++++++++++++++++++--
+ 2 files changed, 341 insertions(+), 30 deletions(-)
+
+diff --git a/package/utils/px5g-mbedtls/Makefile b/package/utils/px5g-mbedtls/Makefile
+index 217e37a..b5b2182 100644
+--- a/package/utils/px5g-mbedtls/Makefile
++++ b/package/utils/px5g-mbedtls/Makefile
+@@ -8,7 +8,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=px5g-mbedtls
+-PKG_RELEASE:=14
++PKG_RELEASE:=15
+ PKG_LICENSE:=LGPL-2.1
+ 
+ PKG_BUILD_FLAGS:=no-mips16
+diff --git a/package/utils/px5g-mbedtls/px5g-mbedtls.c b/package/utils/px5g-mbedtls/px5g-mbedtls.c
+index 4247a57..133d650 100644
+--- a/package/utils/px5g-mbedtls/px5g-mbedtls.c
++++ b/package/utils/px5g-mbedtls/px5g-mbedtls.c
+@@ -31,6 +31,7 @@
+ #include <fcntl.h>
+ #include <stdbool.h>
+ #include <errno.h>
++#include <sys/stat.h>
+ 
+ #include <mbedtls/bignum.h>
+ #include <mbedtls/entropy.h>
+@@ -40,6 +41,9 @@
+ #include <mbedtls/pk.h>
+ #include <mbedtls/asn1.h>
+ #include <mbedtls/oid.h>
++#include <mbedtls/asn1write.h>
++#include <mbedtls/pem.h>
++#include <mbedtls/platform_util.h>
+ 
+ #define SET_OID(x, oid) \
+ 	do { x.len = MBEDTLS_OID_SIZE(oid); x.p = (unsigned char *) oid; } while (0)
+@@ -50,6 +54,32 @@
+ 
+ static char buf[16384];
+ 
++/* ca and sign: write into a new temporary file next to the target (mkstemp: no symlink is
++ * followed, the mode is always set), and only rename them into place once everything worked */
++static bool safe_files;
++static struct { char *tmp, *path; } pending[2];
++static int npending;
++
++static void drop_pending(void)
++{
++	for (int i = 0; i < npending; i++)
++		if (pending[i].tmp)
++			unlink(pending[i].tmp);
++}
++
++static void commit_pending(void)
++{
++	for (int i = 0; i < npending; i++) {
++		if (rename(pending[i].tmp, pending[i].path)) {
++			fprintf(stderr, "error: cannot replace %s: %s\n", pending[i].path, strerror(errno));
++			exit(1);
++		}
++		free(pending[i].tmp);
++		pending[i].tmp = NULL;
++	}
++	npending = 0;
++}
++
+ static int _urandom(void *ctx, unsigned char *out, size_t len)
+ {
+ 	ssize_t ret;
+@@ -80,8 +110,26 @@ static void write_file(const char *path, size_t len, bool pem, bool cert)
+ 	if (cert)
+ 		mode |= S_IRGRP | S_IROTH;
+ 
+-	if (path)
++	if (path && safe_files) {
++		char *tmp = malloc(strlen(path) + 8);
++		if (!tmp || npending >= 2) {
++			fprintf(stderr, "error: out of memory\n");
++			exit(1);
++		}
++		sprintf(tmp, "%s.XXXXXX", path);
++		fd = mkstemp(tmp);
++		if (fd >= 0 && fchmod(fd, mode) < 0) {
++			close(fd);
++			unlink(tmp);
++			fd = -1;
++		}
++		if (fd >= 0) {
++			pending[npending].tmp = tmp;
++			pending[npending++].path = (char *)path;
++		}
++	} else if (path) {
+ 		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
++	}
+ 
+ 	if (fd < 0) {
+ 		fprintf(stderr, "error: I/O error\n");
+@@ -193,9 +241,60 @@ int dokey(bool rsa, char **arg)
+ 	return 0;
+ }
+ 
+-int selfsigned(char **arg)
++enum cert_mode { MODE_SELFSIGNED, MODE_CA, MODE_SIGN };
++
++static int load_ca(mbedtls_x509_crt *crt, const char *path)
+ {
+-	mbedtls_pk_context key;
++	static unsigned char raw[16384];
++	mbedtls_pem_context pem;
++	const unsigned char *der = raw;
++	size_t len, used;
++	FILE *f;
++	int ret;
++
++	f = fopen(path, "rb");
++	if (!f)
++		return -1;
++	len = fread(raw, 1, sizeof(raw) - 1, f);
++	fclose(f);
++	raw[len] = 0;
++
++	mbedtls_pem_init(&pem);
++	if (strstr((char *)raw, "-----BEGIN CERTIFICATE-----")) {
++		if (mbedtls_pem_read_buffer(&pem, "-----BEGIN CERTIFICATE-----",
++				"-----END CERTIFICATE-----", raw, NULL, 0, &used)) {
++			mbedtls_pem_free(&pem);
++			return -1;
++		}
++		der = mbedtls_pem_get_buffer(&pem, &len);
++	}
++	ret = mbedtls_x509_crt_parse_der(crt, der, len);
++	mbedtls_pem_free(&pem);
++	return ret;
++}
++
++static void load_key(mbedtls_pk_context *key, const char *path)
++{
++	mbedtls_pk_init(key);
++	if (mbedtls_pk_parse_keyfile(key, path, NULL, _urandom, NULL)) {
++		fprintf(stderr, "error: cannot read key %s\n", path);
++		exit(1);
++	}
++}
++
++static time_t x509_time_epoch(const mbedtls_x509_time *t)
++{
++	struct tm tm = {
++		.tm_year = t->year - 1900, .tm_mon = t->mon - 1, .tm_mday = t->day,
++		.tm_hour = t->hour, .tm_min = t->min, .tm_sec = t->sec,
++	};
++	return timegm(&tm);
++}
++
++static int gencert(enum cert_mode mode, char **arg)
++{
++	mbedtls_pk_context key, cakey;
++	mbedtls_x509_crt cacrt;
+ 	mbedtls_x509write_cert cert;
+ 	mbedtls_mpi serial;
+ 	mbedtls_x509_san_list *san_list = NULL, *san_prev = NULL, *san_cur = NULL;
+@@ -206,22 +305,27 @@ int selfsigned(char **arg)
+ 	- MBEDTLS_X509_SAN_UNIFORM_RESOURCE_IDENTIFIER
+ 	*/
+ 	mbedtls_asn1_sequence *eku = NULL, **eku_tail = &eku, *ext_key_usage;
++	bool eku_server = false;
+ 	char *usage;
+ 	char *sanval, *santype;
+ 	uint8_t *ipaddr;
+ 	size_t iplen;
+ 
+-	char *subject = "";
++	char *subject = "", *subject_buf = NULL;
++	char issuer[1024];
+ 	unsigned int ksize = 2048;
+ 	int exp = 65537;
+ 	unsigned int days = 30;
+-	char *keypath = NULL, *certpath = NULL;
++	int pathlen = 0;
++	char *keypath = NULL, *certpath = NULL, *inkey = NULL;
++	char *capath = NULL, *cakeypath = NULL;
+ 	bool pem = true;
+ 	time_t from = time(NULL), to;
+ 	char fstr[20], tstr[20], sstr[17];
+ 	int len;
+ 	bool rsa = true;
+ 	mbedtls_ecp_group_id curve = MBEDTLS_ECP_DP_SECP256R1;
++	mbedtls_pk_context *issuer_key = &key;
+ 
+ 	while (*arg && **arg == '-') {
+ 		if (!strcmp(*arg, "-der")) {
+@@ -230,6 +334,10 @@ int selfsigned(char **arg)
+ 			if (!strncmp(arg[1], "rsa:", 4)) {
+ 				rsa = true;
+ 				ksize = (unsigned int)atoi(arg[1] + 4);
++				if (mode != MODE_SELFSIGNED && ksize < 2048) {
++					fprintf(stderr, "error: RSA keys need at least 2048 bits\n");
++					return 1;
++				}
+ 			} else if (!strcmp(arg[1], "ec")) {
+ 				rsa = false;
+ 			} else {
+@@ -238,7 +346,17 @@ int selfsigned(char **arg)
+ 			}
+ 			arg++;
+ 		} else if (!strcmp(*arg, "-days") && arg[1]) {
+-			days = (unsigned int)atoi(arg[1]);
++			if (mode != MODE_SELFSIGNED) {
++				char *e;
++				long d = strtol(arg[1], &e, 10);
++				if (*e || d < 1 || d > 36500) {
++					fprintf(stderr, "error: -days must be 1 to 36500\n");
++					return 1;
++				}
++				days = d;
++			} else {
++				days = (unsigned int)atoi(arg[1]);
++			}
+ 			arg++;
+ 		} else if (!strcmp(*arg, "-pkeyopt") && arg[1]) {
+ 			if (strncmp(arg[1], "ec_paramgen_curve:", 18)) {
+@@ -254,15 +372,34 @@ int selfsigned(char **arg)
+ 		} else if (!strcmp(*arg, "-keyout") && arg[1]) {
+ 			keypath = arg[1];
+ 			arg++;
++		} else if (!strcmp(*arg, "-key") && arg[1] && mode != MODE_SELFSIGNED) {
++			inkey = arg[1];
++			arg++;
++		} else if (!strcmp(*arg, "-CA") && arg[1] && mode == MODE_SIGN) {
++			capath = arg[1];
++			arg++;
++		} else if (!strcmp(*arg, "-CAkey") && arg[1] && mode == MODE_SIGN) {
++			cakeypath = arg[1];
++			arg++;
++		} else if (!strcmp(*arg, "-pathlen") && arg[1] && mode == MODE_CA) {
++			char *e;
++			pathlen = (int)strtol(arg[1], &e, 10);
++			if (*e || pathlen < -1 || pathlen > 8) {
++				fprintf(stderr, "error: -pathlen must be -1 (no limit) to 8\n");
++				return 1;
++			}
++			arg++;
+ 		} else if (!strcmp(*arg, "-out") && arg[1]) {
+ 			certpath = arg[1];
+ 			arg++;
+ 		} else if (!strcmp(*arg, "-subj") && arg[1]) {
+-			if (arg[1][0] != '/' || strchr(arg[1], ';')) {
++			if (arg[1][0] != '/' || strchr(arg[1], ';') ||
++			    (mode != MODE_SELFSIGNED && strpbrk(arg[1], ",+\\\"<>"))) {
+ 				fprintf(stderr, "error: invalid subject");
+ 				return 1;
+ 			}
+-			subject = calloc(strlen(arg[1]) + 1, 1);
++			free(subject_buf);
++			subject = subject_buf = calloc(strlen(arg[1]) + 1, 1);
+ 			char *oldc = arg[1] + 1, *newc = subject, *delim;
+ 			do {
+ 				delim = strchr(oldc, '=');
+@@ -291,8 +428,12 @@ int selfsigned(char **arg)
+ 				ext_key_usage->buf.tag = MBEDTLS_ASN1_OID;
+ 				if (!strcmp(usage, "serverAuth")) {
+ 					SET_OID(ext_key_usage->buf, MBEDTLS_OID_SERVER_AUTH);
++					eku_server = true;
++				} else if (!strcmp(usage, "clientAuth")) {
++					SET_OID(ext_key_usage->buf, MBEDTLS_OID_CLIENT_AUTH);
+ 				} else if (!strcmp(usage, "any") || !strcmp(usage, "anyExtendedKeyUsage")) {
+ 					SET_OID(ext_key_usage->buf, MBEDTLS_OID_ANY_EXTENDED_KEY_USAGE);
++					eku_server = true;
+ 				} else {
+ 					// there are other extendedKeyUsage OIDs but none conceivably useful here
+ 					fprintf(stderr, "error: unsupported extendedKeyUsage: %s\n", usage);
+@@ -356,34 +497,138 @@ int selfsigned(char **arg)
+ 				return 1;
+ 			}
+ 			arg++;
++		} else if (mode != MODE_SELFSIGNED) {
++			//selfsigned keeps skipping unknown options, as it always did
++			fprintf(stderr, "error: unknown or incomplete option: %s\n", *arg);
++			return 1;
+ 		}
+ 		arg++;
+ 	}
+-	gen_key(&key, rsa, ksize, exp, curve, pem);
+ 
+-	if (keypath)
++	if (mode != MODE_SELFSIGNED) {
++		safe_files = true;
++		atexit(drop_pending);
++		//a router that has not got the time yet starts in 1970 or at its build date
++		if (from < 1704067200) {
++			fprintf(stderr, "error: the clock is not set (before 2024); try again after NTP\n");
++			return 1;
++		}
++	}
++	//a server certificate needs a name to be checked against; a client certificate
++	//(-addext extendedKeyUsage=clientAuth only, e.g. for OpenVPN) does not
++	if (mode == MODE_SIGN && !san_list && (!eku || eku_server)) {
++		fprintf(stderr, "error: sign needs at least one -addext subjectAltName=DNS:...|IP:... "
++			"(not for a client certificate: -addext extendedKeyUsage=clientAuth)\n");
++		return 1;
++	}
++
++	if (mode == MODE_SIGN) {
++		if (!capath || !cakeypath) {
++			fprintf(stderr, "error: sign needs -CA <ca.crt> and -CAkey <ca.key>\n");
++			return 1;
++		}
++		mbedtls_x509_crt_init(&cacrt);
++		if (load_ca(&cacrt, capath)) {
++			fprintf(stderr, "error: cannot read CA certificate %s\n", capath);
++			return 1;
++		}
++		if (!mbedtls_x509_crt_get_ca_istrue(&cacrt) ||
++		    mbedtls_x509_crt_check_key_usage(&cacrt, MBEDTLS_X509_KU_KEY_CERT_SIGN)) {
++			fprintf(stderr, "error: %s is not a CA certificate that may sign\n", capath);
++			return 1;
++		}
++		load_key(&cakey, cakeypath);
++		if (mbedtls_pk_check_pair(&cacrt.pk, &cakey, _urandom, NULL)) {
++			fprintf(stderr, "error: %s does not belong to %s\n", cakeypath, capath);
++			return 1;
++		}
++		if (mbedtls_x509_dn_gets(issuer, sizeof(issuer), &cacrt.subject) < 0) {
++			fprintf(stderr, "error: cannot read the CA subject\n");
++			return 1;
++		}
++		if (from < x509_time_epoch(&cacrt.valid_from)) {
++			fprintf(stderr, "error: %s is not valid yet – is the clock right?\n", capath);
++			return 1;
++		}
++		if (from >= x509_time_epoch(&cacrt.valid_to)) {
++			fprintf(stderr, "error: %s has expired; make a new CA\n", capath);
++			return 1;
++		}
++		issuer_key = &cakey;
++	}
++
++	if (inkey) {
++		load_key(&key, inkey);
++	} else {
++		gen_key(&key, rsa, ksize, exp, curve, pem);
++	}
++	if (keypath && mode == MODE_SELFSIGNED)
+ 		write_key(&key, keypath, pem);
++	if (mode == MODE_SIGN && !mbedtls_pk_check_pair(&cacrt.pk, &key, _urandom, NULL)) {
++		fprintf(stderr, "error: the new certificate would use the CA's own key\n");
++		return 1;
++	}
+ 
+ 	from = (from < 1000000000) ? 1000000000 : from;
+-	strftime(fstr, sizeof(fstr), "%Y%m%d%H%M%S", gmtime(&from));
+-	to = from + 60 * 60 * 24 * days;
++	to = from + (time_t)days * 60 * 60 * 24;
+ 	if (to < from)
+ 		to = INT_MAX;
++	if (mode == MODE_SIGN && to > x509_time_epoch(&cacrt.valid_to)) {
++		//a certificate cannot outlive the CA that signed it
++		to = x509_time_epoch(&cacrt.valid_to);
++		fprintf(stderr, "note: validity shortened to the end of the CA certificate\n");
++	}
++	strftime(fstr, sizeof(fstr), "%Y%m%d%H%M%S", gmtime(&from));
+ 	strftime(tstr, sizeof(tstr), "%Y%m%d%H%M%S", gmtime(&to));
+ 
+-	fprintf(stderr, "Generating selfsigned certificate with subject '%s'"
+-			" and validity %s-%s\n", subject, fstr, tstr);
++	fprintf(stderr, "Generating %s certificate with subject '%s'"
++			" and validity %s-%s\n",
++			mode == MODE_CA ? "CA" : mode == MODE_SIGN ? "signed" : "selfsigned",
++			subject, fstr, tstr);
+ 
+ 	mbedtls_x509write_crt_init(&cert);
+-	mbedtls_x509write_crt_set_md_alg(&cert, MBEDTLS_MD_SHA256);
+-	mbedtls_x509write_crt_set_issuer_key(&cert, &key);
++	//selfsigned always used SHA-256; for ca/sign match the signing key (P-384 → SHA-384, P-521 → SHA-512)
++	if (mode != MODE_SELFSIGNED && mbedtls_pk_get_type(issuer_key) == MBEDTLS_PK_ECKEY &&
++	    mbedtls_pk_get_bitlen(issuer_key) > 256)
++		mbedtls_x509write_crt_set_md_alg(&cert, mbedtls_pk_get_bitlen(issuer_key) > 384 ?
++						 MBEDTLS_MD_SHA512 : MBEDTLS_MD_SHA384);
++	else
++		mbedtls_x509write_crt_set_md_alg(&cert, MBEDTLS_MD_SHA256);
++	mbedtls_x509write_crt_set_issuer_key(&cert, issuer_key);
+ 	mbedtls_x509write_crt_set_subject_key(&cert, &key);
+-	mbedtls_x509write_crt_set_subject_name(&cert, subject);
+-	mbedtls_x509write_crt_set_issuer_name(&cert, subject);
+-	mbedtls_x509write_crt_set_validity(&cert, fstr, tstr);
+-	mbedtls_x509write_crt_set_basic_constraints(&cert, 0, -1);
+-	mbedtls_x509write_crt_set_subject_key_identifier(&cert);
+-	mbedtls_x509write_crt_set_authority_key_identifier(&cert);
++	if (mbedtls_x509write_crt_set_subject_name(&cert, subject) ||
++	    mbedtls_x509write_crt_set_issuer_name(&cert, mode == MODE_SIGN ? issuer : subject)) {
++		fprintf(stderr, "error: invalid subject or issuer name\n");
++		return 1;
++	}
++	if (mbedtls_x509write_crt_set_validity(&cert, fstr, tstr) ||
++	    mbedtls_x509write_crt_set_basic_constraints(&cert, mode == MODE_CA, mode == MODE_CA ? pathlen : -1) ||
++	    mbedtls_x509write_crt_set_subject_key_identifier(&cert) ||
++	    mbedtls_x509write_crt_set_authority_key_identifier(&cert)) {
++		fprintf(stderr, "error: failed to set validity, basicConstraints or key identifiers\n");
++		return 1;
++	}
++
++	if (mode == MODE_CA) {
++		if (mbedtls_x509write_crt_set_key_usage(&cert,
++				MBEDTLS_X509_KU_KEY_CERT_SIGN | MBEDTLS_X509_KU_CRL_SIGN)) {
++			fprintf(stderr, "error: failed to add keyUsage\n");
++			return 1;
++		}
++	}
++	if (mode == MODE_SIGN) {
++		if (mbedtls_x509write_crt_set_key_usage(&cert, MBEDTLS_X509_KU_DIGITAL_SIGNATURE |
++				(mbedtls_pk_get_type(&key) == MBEDTLS_PK_RSA ? MBEDTLS_X509_KU_KEY_ENCIPHERMENT : 0))) {
++			fprintf(stderr, "error: failed to add keyUsage\n");
++			return 1;
++		}
++		//a server certificate unless told otherwise
++		if (!eku) {
++			eku = calloc(1, sizeof(mbedtls_asn1_sequence));
++			eku->buf.tag = MBEDTLS_ASN1_OID;
++			SET_OID(eku->buf, MBEDTLS_OID_SERVER_AUTH);
++		}
++	}
+ 	//an empty subjectAltName is not valid, add it only if names were given
+ 	if (san_list && mbedtls_x509write_crt_set_subject_alternative_name(&cert, san_list)) {
+ 		fprintf(stderr, "error: failed to add subjectAltName\n");
+@@ -395,15 +640,58 @@ int selfsigned(char **arg)
+ 		return 1;
+ 	}
+ 
+-	_urandom(NULL, (void *) buf, 8);
++	if (_urandom(NULL, (void *) buf, 8)) {
++		fprintf(stderr, "error: no random numbers for the serial\n");
++		return 1;
++	}
+ 	for (len = 0; len < 8; len++)
+ 		sprintf(sstr + len*2, "%02x", (unsigned char) buf[len]);
+ 
+ 	mbedtls_mpi_init(&serial);
+-	mbedtls_mpi_read_string(&serial, 16, sstr);
+-	mbedtls_x509write_crt_set_serial(&cert, &serial);
++	if (mbedtls_mpi_read_string(&serial, 16, sstr) ||
++	    mbedtls_x509write_crt_set_serial(&cert, &serial)) {
++		fprintf(stderr, "error: failed to set the serial\n");
++		return 1;
++	}
+ 
+-	if (pem) {
++	if (mode != MODE_SELFSIGNED) {
++		//make DER, check it with mbedtls itself, then write
++		static unsigned char der[8192];
++		mbedtls_x509_crt chk;
++		uint32_t flags = 0;
++		size_t olen;
++
++		len = mbedtls_x509write_crt_der(&cert, der, sizeof(der), _urandom, NULL);
++		if (len < 0) {
++			fprintf(stderr, "Failed to generate certificate: %d\n", len);
++			return 1;
++		}
++		mbedtls_x509_crt_init(&chk);
++		if (mbedtls_x509_crt_parse_der(&chk, der + sizeof(der) - len, len) ||
++		    mbedtls_x509_crt_verify(&chk, mode == MODE_CA ? &chk : &cacrt, NULL, NULL, &flags, NULL, NULL)) {
++			char why[512] = "";
++			mbedtls_x509_crt_verify_info(why, sizeof(why), "  ", flags);
++			fprintf(stderr, "error: the new certificate does not verify against %s:\n%s",
++				mode == MODE_CA ? "itself" : capath, why);
++			return 1;
++		}
++		mbedtls_x509_crt_free(&chk);
++
++		if (keypath)
++			write_key(&key, keypath, pem);
++		if (pem) {
++			if (mbedtls_pem_write_buffer("-----BEGIN CERTIFICATE-----\n", "-----END CERTIFICATE-----\n",
++					der + sizeof(der) - len, len, (unsigned char *)buf, sizeof(buf), &olen)) {
++				fprintf(stderr, "Failed to generate certificate\n");
++				return 1;
++			}
++			len = strlen(buf);
++		} else {
++			memcpy(buf + sizeof(buf) - len, der + sizeof(der) - len, len);
++		}
++		write_file(certpath, len, pem, true);
++		commit_pending();
++	} else if (pem) {
+ 		if (mbedtls_x509write_crt_pem(&cert, (void *) buf, sizeof(buf), _urandom, NULL) < 0) {
+ 			fprintf(stderr, "Failed to generate certificate\n");
+ 			return 1;
+@@ -417,11 +705,30 @@ int selfsigned(char **arg)
+ 			return 1;
+ 		}
+ 	}
+-	write_file(certpath, len, pem, true);
++	if (mode == MODE_SELFSIGNED)
++		write_file(certpath, len, pem, true);
+ 
+ 	mbedtls_x509write_crt_free(&cert);
+ 	mbedtls_mpi_free(&serial);
+ 	mbedtls_pk_free(&key);
++	if (mode == MODE_SIGN) {
++		mbedtls_pk_free(&cakey);
++		mbedtls_x509_crt_free(&cacrt);
++	}
++	free(subject_buf);
++	while (eku) {
++		mbedtls_asn1_sequence *next = eku->next;
++		free(eku);
++		eku = next;
++	}
++	while (san_list) {
++		mbedtls_x509_san_list *next = san_list->next;
++		if (san_list->node.type == MBEDTLS_X509_SAN_IP_ADDRESS)
++			free(san_list->node.san.unstructured_name.p);
++		free(san_list);
++		san_list = next;
++	}
++	mbedtls_platform_zeroize(buf, sizeof(buf));	//held the new private key
+ 
+ 	return 0;
+ }
+@@ -435,12 +742,16 @@ int main(int argc, char *argv[])
+ 	} else if (!strcmp(argv[1], "rsakey")) {
+ 		return dokey(true, argv+2);
+ 	} else if (!strcmp(argv[1], "selfsigned")) {
+-		return selfsigned(argv+2);
++		return gencert(MODE_SELFSIGNED, argv+2);
++	} else if (!strcmp(argv[1], "ca")) {
++		return gencert(MODE_CA, argv+2);
++	} else if (!strcmp(argv[1], "sign")) {
++		return gencert(MODE_SIGN, argv+2);
+ 	}
+ 
+ 	fprintf(stderr,
+ 		"PX5G X.509 Certificate Generator Utility v" PX5G_VERSION "\n" PX5G_COPY
+ 		"\nbased on PolarSSL by Christophe Devine and Paul Bakker\n\n");
+-	fprintf(stderr, "Usage: %s [eckey|rsakey|selfsigned]\n", *argv);
++	fprintf(stderr, "Usage: %s [eckey|rsakey|selfsigned|ca|sign]\n", *argv);
+ 	return 1;
+ }
+-- 
+2.43.0
+

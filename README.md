@@ -1,9 +1,9 @@
 # px5g `ca` and `sign` – proposal
 
 > **Status: proposal.** A suggested extension to OpenWrt's `px5g-mbedtls`, not part of OpenWrt and not
-> reviewed or approved by OpenWrt developers. Tested on one router (Cudy WR3000 v1, mediatek/filogic,
-> OpenWrt 25.12.6, aarch64: ~26 KB built against the router's own mbedtls 3.6; OpenVPN 2.7 with mbed TLS
-> accepts the client certificates) and with the included 50 checks. Use at your own risk.
+> reviewed or approved by OpenWrt developers. In daily use on one router (Cudy WR3000 v1, mediatek/filogic,
+> OpenWrt 25.12.6; OpenVPN 2.7 with mbed TLS accepts the client certificates it signs); the 50 checks
+> pass on x86_64 and on emulated aarch64, MIPS (both byte orders) and ARMv7. Use at your own risk.
 >
 > Written with the help of Claude (an AI assistant); reviewed and tested by the repository owner.
 
@@ -74,14 +74,13 @@ the name limits whether the extension is critical or not. So:
 - `px5g ca` marks nameConstraints non-critical unless you write `critical,`.
 - `px5g sign` still reads a CA with critical nameConstraints (also one made by OpenSSL),
   through `mbedtls_x509_crt_parse_der_with_ext_cb`.
-- Home Access 26.11.35 makes its CA the same way (non-critical); see the Home Access notes.
 
 ## Test on a PC (Linux or WSL)
 
-Ubuntu's `libmbedtls-dev` is still 2.28, so build mbedtls 3.6 (as in OpenWrt 25.12) yourself:
+Ubuntu's `libmbedtls-dev` is still 2.28, so build mbedtls 3.6.7 (as in OpenWrt 25.12) yourself:
 
 ```sh
-git clone --depth 1 -b v3.6.2 https://github.com/Mbed-TLS/mbedtls.git
+git clone --depth 1 -b v3.6.7 https://github.com/Mbed-TLS/mbedtls.git
 git -C mbedtls submodule update --init --depth 1
 make -C mbedtls lib -j4
 gcc -Wall -Werror -O2 -Imbedtls/include -o px5g px5g-mbedtls.c \
@@ -92,48 +91,43 @@ mkdir t && cd t && sh ../test.sh ../px5g      # needs openssl on the PC to check
 `test.sh` runs 50 checks: what is made (checked with `openssl verify -x509_strict -purpose
 sslserver`), the name limits, keys and CA checks, file handling and input checks – one or more
 per review finding. `testdata/` holds two throw-away test CAs (expired, and valid only from 2090);
-never use them for anything else. All 50 pass here, also under AddressSanitizer.
+never use them for anything else. All 50 pass, also under AddressSanitizer and UBSan; no memory is
+left allocated after a successful run (error paths exit straight away, as in the original px5g).
 
-## Test on the router (OpenWrt 25.12 SDK)
+## Tested targets and size
 
-The WR3000 v1 is `mediatek/filogic` (aarch64). With the 25.12 SDK for that target:
+Built like OpenWrt builds px5g-mbedtls: musl 1.2.5, dynamically linked to mbedtls 3.6 configured as in
+OpenWrt 25.12, `-Os`, stripped. The 50 checks were run on each build (aarch64, MIPS and ARMv7 under
+qemu-user; the aarch64 build also on the real router).
 
-```sh
-cd openwrt-sdk-25.12*-mediatek-filogic*
-./scripts/feeds update base && ./scripts/feeds install px5g-mbedtls
-patch -p1 -d feeds/base < /path/to/0001-px5g-mbedtls-add-ca-and-sign.patch   # or copy px5g-mbedtls.c over it
-make defconfig && make package/px5g-mbedtls/compile V=s
-find bin -name 'px5g-mbedtls*.apk'
-```
+| Target (OpenWrt arch) | original px5g | with ca/sign | 50 checks |
+|---|---:|---:|---|
+| aarch64_cortex-a53 (mediatek/filogic) | 13.7 KB | 26.0 KB | pass (router + qemu) |
+| mipsel_24kc (ramips/mt7621) | 12.0 KB | 25.6 KB | pass (qemu) |
+| mips_24kc (ath79) | 12.0 KB | 25.6 KB | pass (qemu) |
+| arm_cortex-a7_neon-vfpv4 (ipq40xx) | 11.3 KB | 23.4 KB | pass (qemu) |
 
-On the router (copy the .apk to /tmp first):
+(The official 25.12 aarch64 package is 16.3 KB; the difference to the 13.7 KB here comes from build
+flags. The increase, about 12–14 KB, is what the change adds.)
 
-```sh
-apk add --allow-untrusted /tmp/px5g-mbedtls-*.apk
-px5g ca -newkey ec -subj /CN=test -keyout /tmp/ca.key -out /tmp/ca.crt
-px5g sign -CA /tmp/ca.crt -CAkey /tmp/ca.key -newkey ec -subj /CN=test.lan \
-    -addext subjectAltName=DNS:test.lan -keyout /tmp/t.key -out /tmp/t.crt
-```
+## For the maintainer
 
-Keeping it installed is harmless: `selfsigned` (used by uhttpd) is unchanged. To go back to
-the official build, reinstall px5g-mbedtls from the feed. The SDK and router steps could not be
-run here (no OpenWrt SDK in this environment); the PC build is what was tested.
+`patches/` holds the change as a series for OpenWrt master (applies with `git am`):
 
-## Files
+1. `0001-px5g-mbedtls-add-ca-and-sign-commands.patch` – `ca` and `sign`, server and client certificates,
+   safe file writing; `PKG_RELEASE` 14 → 15. Builds with `-Wall -Werror` on its own.
+2. `0002-px5g-mbedtls-add-nameConstraints-to-ca.patch` – optional name limits for a CA, enforced by
+   `sign`; `PKG_RELEASE` 15 → 16.
 
-- `px5g-mbedtls.c` – the whole changed source (drop-in for `package/utils/px5g-mbedtls/`)
-- `0001-px5g-mbedtls-add-ca-and-sign.patch` – the same as a diff against openwrt main
-- `test.sh` – the checks above, `testdata/` – two throw-away CAs for the date checks
-
-Same licence as px5g (LGPL-2.1). Prototype for discussion with the px5g maintainers, not merged anywhere.
-
+The patches carry no `Signed-off-by:` line yet. The author is happy for the px5g maintainer to take the
+code over, change it as needed and submit it under their own name.
 
 ## Files
 
 | File | What |
 |---|---|
-| `0001-px5g-mbedtls-add-ca-and-sign.patch` | the change, against `package/utils/px5g-mbedtls/px5g-mbedtls.c` in OpenWrt master |
-| `px5g-mbedtls.c` | the complete file with the change applied, for reading |
+| `patches/0001-…`, `patches/0002-…` | the change as a patch series for OpenWrt master |
+| `px5g-mbedtls.c` | the complete file with both patches applied, for reading |
 | `test.sh`, `testdata/` | the 50 checks: `sh test.sh /path/to/px5g` (needs `openssl` on the PC) |
 | `LICENSE` | LGPL-2.1, as the original `px5g-mbedtls.c` |
 

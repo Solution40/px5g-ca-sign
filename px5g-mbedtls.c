@@ -546,7 +546,7 @@ static int gencert(enum cert_mode mode, char **arg)
 	int nc_n = 0;
 	bool nc_critical = false;
 
-	char *subject = "";
+	char *subject = "", *subject_buf = NULL;
 	char issuer[1024];
 	unsigned int ksize = 2048;
 	int exp = 65537;
@@ -633,7 +633,8 @@ static int gencert(enum cert_mode mode, char **arg)
 				fprintf(stderr, "error: invalid subject");
 				return 1;
 			}
-			subject = calloc(strlen(arg[1]) + 1, 1);
+			free(subject_buf);
+			subject = subject_buf = calloc(strlen(arg[1]) + 1, 1);
 			char *oldc = arg[1] + 1, *newc = subject, *delim;
 			do {
 				delim = strchr(oldc, '=');
@@ -1008,6 +1009,19 @@ static int gencert(enum cert_mode mode, char **arg)
 		mbedtls_x509_crt_free(&cacrt);
 	}
 	free(nc);
+	free(subject_buf);
+	while (eku) {
+		mbedtls_asn1_sequence *next = eku->next;
+		free(eku);
+		eku = next;
+	}
+	while (san_list) {
+		mbedtls_x509_san_list *next = san_list->next;
+		if (san_list->node.type == MBEDTLS_X509_SAN_IP_ADDRESS)
+			free(san_list->node.san.unstructured_name.p);
+		free(san_list);
+		san_list = next;
+	}
 	mbedtls_platform_zeroize(buf, sizeof(buf));	//held the new private key
 
 	return 0;
